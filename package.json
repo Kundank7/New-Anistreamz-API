@@ -1,5 +1,11 @@
 {
   "name": "all-api",
   "version": "1.0.0",
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
 }
