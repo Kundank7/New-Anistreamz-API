@@ -1,6 +1,5 @@
 const __name = (fn, _) => fn;
 import { getMedia } from '../core/anilist.js';
-import express from 'express'; // <-- Added Express for Render execution
 
 var BASE = "https://reanime.to";
 var FLIX = "https://flixcloud.cc";
@@ -102,7 +101,7 @@ function parseJsLiteral(src) {
     while (i < src.length && src[i] !== '"') {
       if (src[i] === "\\") {
         i++;
-        const e = { n: "\n", t: "        ", r: "\r", '"': '"', "\\": "\\" };
+        const e = { n: "\n", t: "       ", r: "\r", '"': '"', "\\": "\\" };
         r += e[src[i]] ?? src[i];
         i++;
       } else r += src[i++];
@@ -734,45 +733,5 @@ async function getEpisodes3(anilistId, ctx = {}) {
   };
 }
 __name(getEpisodes3, "getEpisodes");
-
-// --- EXPRESS ROUTING BRIDGE FOR RENDER START ---
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-app.all('*', async (req, res) => {
-  const protocol = req.protocol;
-  const host = req.get('host');
-  const fullUrl = `${protocol}://${host}${req.originalUrl}`;
-  
-  const workerRequest = new Request(fullUrl, {
-    method: req.method,
-    headers: req.headers,
-    body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body
-  });
-
-  try {
-    const workerResponse = await reanime_default.fetch(workerRequest);
-    
-    res.status(workerResponse.status);
-    workerResponse.headers.forEach((value, key) => {
-      res.setHeader(key, value);
-    });
-    
-    if (workerResponse.status === 302) {
-      return res.redirect(workerResponse.headers.get('Location'));
-    }
-
-    const bodyText = await workerResponse.text();
-    res.send(bodyText);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Reanime Provider listening on port ${PORT}`);
-});
-// --- EXPRESS ROUTING BRIDGE FOR RENDER END ---
-
 export default reanime_default;
 export { getEpisodes3 as getEpisodes };
