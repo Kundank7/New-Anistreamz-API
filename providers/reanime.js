@@ -101,7 +101,7 @@ function parseJsLiteral(src) {
     while (i < src.length && src[i] !== '"') {
       if (src[i] === "\\") {
         i++;
-        const e = { n: "\n", t: "       ", r: "\r", '"': '"', "\\": "\\" };
+        const e = { n: "\n", t: "        ", r: "\r", '"': '"', "\\": "\\" };
         r += e[src[i]] ?? src[i];
         i++;
       } else r += src[i++];
@@ -345,10 +345,19 @@ async function decryptEmbed(html) {
     e.debug = { fields, topKeys: Object.keys(data).slice(0, 20) };
     throw e;
   }
-  const tokData = await fetch(`${FLIX}/api/m3u8/${token}`, { headers: { ...H, Referer: `${BASE}/` } }).then((r) => {
-    if (!r.ok) throw new Error(`Token API ${r.status}`);
-    return r.json();
-  });
+
+  // FIXED: Wrapped token call with proper response validation
+  const r = await fetch(`${FLIX}/api/m3u8/${token}`, { headers: { ...H, Referer: `${BASE}/` } });
+  if (!r.ok) throw new Error(`Token API request failed with status: ${r.status}`);
+  
+  const rawText = await r.text();
+  let tokData;
+  try {
+    tokData = JSON.parse(rawText);
+  } catch (err) {
+    throw new Error(`FlixCloud API returned HTML page instead of JSON. Upstream is likely blocking Render server IPs.`);
+  }
+
   const vidKey = (await sha256hex(token + "vid")).substring(0, 10);
   const keyKey = (await sha256hex(token + "key")).substring(0, 10);
   const v_bytes = b64toU8(tokData[vidKey]);
@@ -409,7 +418,10 @@ __name(decryptEmbed, "decryptEmbed");
 async function resolveIds(anilistId) {
   const [media, anizip] = await Promise.all([
     getMedia(anilistId),
-    fetch(`${ANIZIP2}?anilist_id=${anilistId}`).then((r) => r.json()).catch(() => null)
+    fetch(`${ANIZIP2}?anilist_id=${anilistId}`).then((r) => {
+      if (!r.ok) return null;
+      return r.json();
+    }).catch(() => null)
   ]);
   if (!media) throw new Error(`AniList ID ${anilistId} not found`);
   return {
@@ -420,7 +432,17 @@ async function resolveIds(anilistId) {
 }
 __name(resolveIds, "resolveIds");
 async function findSlug(title2) {
-  const data = await fetch(`${BASE}/api/search?${new URLSearchParams({ q: title2, limit: 5 })}`, { headers: H }).then((r) => r.json());
+  const res = await fetch(`${BASE}/api/search?${new URLSearchParams({ q: title2, limit: 5 })}`, { headers: H });
+  if (!res.ok) throw new Error(`Reanime search API failed with status ${res.status}`);
+  
+  const rawText = await res.text();
+  let data;
+  try {
+    data = JSON.parse(rawText);
+  } catch(err) {
+    throw new Error(`Reanime Search API returned HTML page. Upstream is likely blocking Render server IPs.`);
+  }
+
   const results = Array.isArray(data) ? data : data.results ?? data.data ?? [];
   if (!results.length) throw new Error(`No reanime results for "${title2}"`);
   const id = results[0].anime_id ?? results[0].slug ?? results[0].id;
@@ -520,18 +542,30 @@ async function resolveStream3(anilistId, audio, ep) {
   const slug = await findSlug(title2);
   const order = { "HD-2": 0, "HD-1": 1 };
   const byPrio = (arr) => arr.slice().sort((a, b) => (order[a.serverName] ?? 9) - (order[b.serverName] ?? 9));
+  
+  // FIXED: Explicit text matching handling inside Promise block to track layout response structure securely
   const [watchRes, flixRes] = await Promise.allSettled([
-    fetch(`${BASE}/api/watch/${slug}/${ep}`, { headers: H }).then((r) => {
-      if (!r.ok) throw new Error(`watch ${r.status}`);
-      return r.json();
+    fetch(`${BASE}/api/watch/${slug}/${ep}`, { headers: H }).then(async (r) => {
+      if (!r.ok) throw new Error(`watch failed with status ${r.status}`);
+      const text = await r.text();
+      try { return JSON.parse(text); } catch { throw new Error("Watch API returned HTML page. Blocked by upstream."); }
     }),
-    fetch(`${BASE}/api/flix/${anilistId}/${ep}`, { headers: H }).then((r) => {
-      if (!r.ok) throw new Error(`flix ${r.status}`);
-      return r.json();
+    fetch(`${BASE}/api/flix/${anilistId}/${ep}`, { headers: H }).then(async (r) => {
+      if (!r.ok) throw new Error(`flix failed with status ${r.status}`);
+      const text = await r.text();
+      try { return JSON.parse(text); } catch { throw new Error("Flix API returned HTML page. Blocked by upstream."); }
     })
   ]);
   const watchData = watchRes.status === "fulfilled" ? watchRes.value : null;
   const flixData = flixRes.status === "fulfilled" ? flixRes.value : null;
+  
+  if (!watchData && watchRes.status === "rejected") {
+    throw watchRes.reason;
+  }
+  if (!flixData && flixRes.status === "rejected") {
+    throw flixRes.reason;
+  }
+
   const links = [...watchData?.episode_links ?? []];
   if (flixData?.success && flixData?.servers) {
     const seen = new Set(links.map((s) => s["$id"]));
