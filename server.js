@@ -1,5 +1,5 @@
-import { getMedia }                from "./core/anilist.js";
-import { mapAnimeIds }             from "./core/mapper.js";
+import { getMedia }                 from "./core/anilist.js";
+import { mapAnimeIds }              from "./core/mapper.js";
 import paheHandler                 from "./providers/animepahe.js";
 import mangaHandler                from "./providers/allmanga.js";
 import reanimeHandler              from "./providers/reanime.js";
@@ -9,6 +9,8 @@ import aninekoHandler              from "./providers/anineko.js";
 import anidbappHandler             from "./providers/anidbapp.js";
 import { getEpisodesResponse }     from "./core/episode-cache.js";
 import { getAsync, setAsync, isFresh, mapTTL, WATCH_TTL, _CACHE_ENABLED } from "./core/smartcache.js";
+
+import express from 'express'; // <-- Added Express for Render support
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
@@ -56,7 +58,7 @@ async function cachedWatch(cacheKey, handlerFn) {
   finally { watchInflight.delete(cacheKey); }
 }
 
-export default {
+const mainWorker = {
   async fetch(request, env) {
     const url  = new URL(request.url);
     const path = url.pathname;
@@ -198,3 +200,45 @@ export default {
     });
   },
 };
+
+// --- EXPRESS SERVER WRAPPER FOR RENDER START ---
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+app.all('*', async (req, res) => {
+  const protocol = req.protocol;
+  const host = req.get('host');
+  const fullUrl = `${protocol}://${host}${req.originalUrl}`;
+  
+  const workerRequest = new Request(fullUrl, {
+    method: req.method,
+    headers: req.headers,
+    body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body
+  });
+
+  try {
+    const env = process.env; 
+    const workerResponse = await mainWorker.fetch(workerRequest, env);
+    
+    res.status(workerResponse.status);
+    workerResponse.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+    
+    if (workerResponse.status === 302) {
+      return res.redirect(workerResponse.headers.get('Location'));
+    }
+
+    const bodyText = await workerResponse.text();
+    res.send(bodyText);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Anivexa Main API Server listening on port ${PORT}`);
+});
+// --- EXPRESS SERVER WRAPPER FOR RENDER END ---
+
+export default mainWorker;
