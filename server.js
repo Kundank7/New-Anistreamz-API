@@ -1,52 +1,244 @@
-import http from "node:http";
-import worker from "./index.js";
+import { getMedia }                 from "./core/anilist.js";
+import { mapAnimeIds }              from "./core/mapper.js";
+import paheHandler                 from "./providers/animepahe.js";
+import mangaHandler                from "./providers/allmanga.js";
+import reanimeHandler              from "./providers/reanime.js";
+import anikotoHandler              from "./providers/anikoto.js";
+import animeggHandler              from "./providers/animegg.js";
+import aninekoHandler              from "./providers/anineko.js";
+import anidbappHandler             from "./providers/anidbapp.js";
+import { getEpisodesResponse }     from "./core/episode-cache.js";
+import { getAsync, setAsync, isFresh, mapTTL, WATCH_TTL, _CACHE_ENABLED } from "./core/smartcache.js";
 
-const PORT = process.env.PORT ?? 4000;
+import express from 'express'; // <-- Added Express for Render support
 
-async function nodeToRequest(req) {
-  const host = req.headers["host"] ?? `localhost:${PORT}`;
-  const url = `http://${host}${req.url}`;
-
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const body = chunks.length ? Buffer.concat(chunks) : null;
-
-  return new Request(url, {
-    method: req.method,
-    headers: req.headers,
-    body: body?.length ? body : undefined,
-    duplex: "half",
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=300",
+    },
   });
 }
 
-const server = http.createServer(async (req, res) => {
-  console.log(`→ ${req.method} ${req.url}`);
+function rewriteRequest(request, newPath) {
+  const u = new URL(request.url);
+  u.pathname = newPath;
+  return new Request(u.toString(), { method: request.method, headers: request.headers });
+}
+
+const watchInflight = new Map();
+
+async function cachedWatch(cacheKey, handlerFn) {
+  const entry = await getAsync(cacheKey);
+  if (entry && isFresh(entry)) return json(entry.data);
+
+  if (watchInflight.has(cacheKey)) {
+    await watchInflight.get(cacheKey).catch(() => {});
+    const warm = await getAsync(cacheKey);
+    if (warm && isFresh(warm)) return json(warm.data);
+    return handlerFn();
+  }
+
+  const promise = (async () => {
+    const response = await handlerFn();
+    if (response.status === 200) {
+      try {
+        const data = await response.clone().json();
+        await setAsync(cacheKey, data, WATCH_TTL);
+      } catch {}
+    }
+    return response;
+  })();
+
+  watchInflight.set(cacheKey, promise);
+  try   { return await promise; }
+  finally { watchInflight.delete(cacheKey); }
+}
+
+const mainWorker = {
+  async fetch(request, env) {
+    const url  = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin":  "*",
+          "Access-Control-Allow-Methods": "GET, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+        },
+      });
+    }
+
+    let m = path.match(/^\/map\/(\d+)\/?$/);
+    if (m) {
+      const anilistId = m[1];
+      const cacheKey  = `map:${anilistId}`;
+      const entry     = await getAsync(cacheKey);
+      if (entry && isFresh(entry)) return json(entry.data);
+
+      try {
+        const [data, media] = await Promise.all([
+          mapAnimeIds(anilistId),
+          getMedia(anilistId).catch(() => null),
+        ]);
+        await setAsync(cacheKey, data, mapTTL(media?.status ?? "RELEASING"));
+        return json(data);
+      } catch (e) {
+        if (entry) return json(entry.data);
+        return json({ error: e.message }, 500);
+      }
+    }
+
+    m = path.match(/^\/episodes\/(\d+)\/?$/);
+    if (m) {
+      const anilistId = m[1];
+      try {
+        return json(await getEpisodesResponse(anilistId, env));
+      } catch (e) {
+        return json({ error: e.message }, 500);
+      }
+    }
+
+    m = path.match(/^\/watch\/animepahe\/(\d+)\/(sub|dub)\/animepahe-(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return cachedWatch(
+        `watch:pahe:${id}:${audio}:${ep}`,
+        () => paheHandler.fetch(rewriteRequest(request, `/watch/${id}/${audio}/${ep}`))
+      );
+    }
+
+    m = path.match(/^\/watch\/allmanga\/(\d+)\/(sub|dub)\/allmanga-(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return cachedWatch(
+        `watch:manga:${id}:${audio}:${ep}`,
+        () => mangaHandler.fetch(request)
+      );
+    }
+
+    m = path.match(/^\/watch\/reanime\/(\d+)\/(sub|dub)\/reanime-(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return cachedWatch(
+        `watch:reanime:${id}:${audio}:${ep}`,
+        () => reanimeHandler.fetch(rewriteRequest(request, `/watch/${id}/${audio}/${ep}`))
+      );
+    }
+
+    m = path.match(/^\/stream\/reanime\/(\d+)\/(sub|dub)\/(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return reanimeHandler.fetch(rewriteRequest(request, `/stream/${id}/${audio}/${ep}`));
+    }
+
+    m = path.match(/^\/watch\/anikoto\/(\d+)\/(sub|dub)\/anikoto-(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return cachedWatch(
+        `watch:anikoto:${id}:${audio}:${ep}`,
+        () => anikotoHandler.fetch(request)
+      );
+    }
+
+    m = path.match(/^\/watch\/animegg\/(\d+)\/(sub|dub)\/animegg-(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return cachedWatch(
+        `watch:animegg:${id}:${audio}:${ep}`,
+        () => animeggHandler.fetch(request)
+      );
+    }
+
+    m = path.match(/^\/watch\/anineko\/(\d+)\/(sub|dub)\/anineko-(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return cachedWatch(
+        `watch:anineko:${id}:${audio}:${ep}`,
+        () => aninekoHandler.fetch(request)
+      );
+    }
+
+    m = path.match(/^\/watch\/anidbapp\/(\d+)\/(sub|dub)\/anidbapp-(\d+)\/?$/);
+    if (m) {
+      const [, id, audio, ep] = m;
+      return cachedWatch(
+        `watch:anidbapp:${id}:${audio}:${ep}`,
+        () => anidbappHandler.fetch(request)
+      );
+    }
+
+    return json({
+      name: "Anivexa API 2.1", //actually i will goon to you if you change this ok? so erm..maybe i wont..or maybe i will idk
+      cache: _CACHE_ENABLED,
+      providers: [
+        "animepahe",
+        "allmanga",
+        "reanime",
+        "anikoto",
+        "animegg",
+        "anineko",
+        "anidbapp",
+      ],
+      routes: [
+        "/map/:anilistId",
+        "/episodes/:anilistId",
+        "/watch/animepahe/:id/sub|dub/animepahe-:ep",
+        "/watch/allmanga/:id/sub|dub/allmanga-:ep",
+        "/watch/reanime/:id/sub|dub/reanime-:ep",
+        "/stream/reanime/:id/sub|dub/:ep",
+        "/watch/anikoto/:id/sub|dub/anikoto-:ep",
+        "/watch/animegg/:id/sub|dub/animegg-:ep",
+        "/watch/anineko/:id/sub|dub/anineko-:ep",
+        "/watch/anidbapp/:id/sub|dub/anidbapp-:ep",
+      ],
+    });
+  },
+};
+
+// --- EXPRESS SERVER WRAPPER FOR RENDER START ---
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+app.all('*', async (req, res) => {
+  const protocol = req.protocol;
+  const host = req.get('host');
+  const fullUrl = `${protocol}://${host}${req.originalUrl}`;
+  
+  const workerRequest = new Request(fullUrl, {
+    method: req.method,
+    headers: req.headers,
+    body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body
+  });
+
   try {
-    const request  = await nodeToRequest(req);
-    const response = await worker.fetch(request, {});
+    const env = process.env; 
+    const workerResponse = await mainWorker.fetch(workerRequest, env);
+    
+    res.status(workerResponse.status);
+    workerResponse.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+    
+    if (workerResponse.status === 302) {
+      return res.redirect(workerResponse.headers.get('Location'));
+    }
 
-    res.statusCode = response.status;
-    for (const [k, v] of response.headers) res.setHeader(k, v);
-
-    const buf = await response.arrayBuffer();
-    res.end(Buffer.from(buf));
+    const bodyText = await workerResponse.text();
+    res.send(bodyText);
   } catch (err) {
-    console.error("Unhandled error:", err);
-    res.statusCode = 500;
-    res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({ error: err.message }));
+    res.status(500).json({ error: err.message });
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`api-vexa dev server running at http://localhost:${PORT}`);
-  console.log(`  GET /map/:anilistId`);
-  console.log(`  GET /episodes/:anilistId`);
-  console.log(`  GET /watch/animepahe/:id/sub|dub/animepahe-:ep`);
-  console.log(`  GET /watch/allmanga/:id/sub|dub/allmanga-:ep`);
-  console.log(`  GET /watch/reanime/:id/sub|dub/reanime-:ep`);
-  console.log(`  GET /watch/anikoto/:id/sub|dub/anikoto-:ep`);
-  console.log(`  GET /watch/animegg/:id/sub|dub/animegg-:ep`);
-  console.log(`  GET /watch/anineko/:id/sub|dub/anineko-:ep`);
-  console.log(`  GET /watch/anidbapp/:id/sub|dub/anidbapp-:ep`);
+app.listen(PORT, () => {
+  console.log(`Anivexa Main API Server listening on port ${PORT}`);
 });
+// --- EXPRESS SERVER WRAPPER FOR RENDER END ---
+
+export default mainWorker;
